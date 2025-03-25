@@ -49,6 +49,21 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
+	log []LogEntry
+	// only use when it is leader. log view for each peer
+	matchIndex []int // match point probe when log synchronized
+	nextIndex  []int // match point records after log sync success
+
+	// apply log loop
+	// committed: committed to log, but not apply to state machine
+	// applied: applied to state machine
+	// comitIndex last log index committed to log
+	commitIndex int
+	// lastApplied: last log index applied to state machine
+	lastApplied int
+	applyCh     chan raftapi.ApplyMsg
+	applyCond   *sync.Cond
+
 	electionStart   time.Time
 	electionTimeout time.Duration // random
 }
@@ -74,6 +89,10 @@ func (rf *Raft) becomeLeaderLocked() {
 
 	LOG(rf.me, rf.currentTerm, DLeader, "Become Leader in T%d", rf.currentTerm)
 	rf.role = Leader
+	for peer := 0; peer < len(rf.peers); peer++ {
+		rf.matchIndex[peer] = 0
+		rf.nextIndex[peer] = len(rf.log)
+	}
 }
 
 func (rf *Raft) becomeFollowerLocked(term int) {
@@ -166,13 +185,22 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.role != Leader {
+		return 0, 0, false
+	}
+
+	rf.log = append(rf.log, LogEntry{
+		CommandValid: true,
+		Command:      command,
+		Term:         rf.currentTerm,
+	})
+	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", len(rf.log)-1, rf.currentTerm)
+
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -216,15 +244,29 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// Your initialization code here (3A, 3B, 3C).
 	rf.role = Follower
-	rf.currentTerm = 1
+	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.resetElectionTimerLocked()
+
+	// a dummy entry to aovid lots of corner checks
+	rf.log = append(rf.log, LogEntry{})
+
+	// initialize the leader's view slice
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
+
+	// initialize the fields used for apply
+	rf.commitIndex = 0
+	rf.lastApplied = 0
+	rf.applyCh = applyCh
+	rf.applyCond = sync.NewCond(&rf.mu)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.electionTicker()
+	go rf.applicationTicker()
 
 	return rf
 }

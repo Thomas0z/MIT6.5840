@@ -16,12 +16,28 @@ func (rf *Raft) resetElectionTimerLocked() {
 	rf.electionTimeout = electionTimeoutMin + time.Duration(rand.Int63()%randRange)
 }
 
+// check whether my last log is more up to date than the candidate's last log
+func (rf *Raft) isMoreUpToDateLocked(candidateLastLogIndex, candidateLastLogTerm int) bool {
+	l := len(rf.log)
+	lastLogIndex, lastLogTerm := l-1, rf.log[l-1].Term
+
+	LOG(rf.me, rf.currentTerm, DVote, "Compare last log, Me: [%d]T%d, Candidate: [%d]T%d",
+		lastLogIndex, lastLogTerm, candidateLastLogIndex, candidateLastLogTerm)
+	if lastLogTerm != candidateLastLogTerm {
+		return lastLogTerm > candidateLastLogTerm
+	}
+	return lastLogIndex > candidateLastLogIndex
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
 	Term        int
 	CandidateId int
+
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 func (args *RequestVoteArgs) String() string {
@@ -61,6 +77,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		LOG(rf.me, rf.currentTerm, DVote, "<- S%d, Reject voted, Already voted to S%d", args.CandidateId, rf.votedFor)
 		return
 	}
+
+	if rf.isMoreUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
+		LOG(rf.me, rf.currentTerm, DVote, "-> S%d, Reject voted, Candidate log less up-to-date", args.CandidateId)
+		return
+	}
+
 	reply.VoteGranted = true
 	rf.votedFor = args.CandidateId
 	rf.resetElectionTimerLocked()
@@ -136,6 +158,7 @@ func (rf *Raft) startElection(term int) {
 		LOG(rf.me, rf.currentTerm, DVote, "Lost Candidate[T%d] to %s[T%d], abort RequestVote", rf.role, term, rf.currentTerm)
 		return
 	}
+	l := len(rf.log)
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			votes++
@@ -143,8 +166,10 @@ func (rf *Raft) startElection(term int) {
 		}
 
 		args := &RequestVoteArgs{
-			Term:        rf.currentTerm,
-			CandidateId: rf.me,
+			Term:         rf.currentTerm,
+			CandidateId:  rf.me,
+			LastLogIndex: l - 1,
+			LastLogTerm:  rf.log[l-1].Term,
 		}
 		LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, AskVote, Args=%v", peer, args.String())
 		go processVote(peer, args)
