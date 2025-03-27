@@ -22,6 +22,7 @@ const (
 	DSendLog    logTopic = "LOG1"
 	DReceiveLog logTopic = "LOG2"
 	DApply      logTopic = "APLY"
+	DPersist    logTopic = "PERS"
 )
 
 func getTopicLevel(topic logTopic) int {

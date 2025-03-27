@@ -28,6 +28,10 @@ func (args *AppendEntriesArgs) String() string {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// ConflictTerm
+	ConflictTerm int
+	// ConflictIndex
+	ConflictIndex int
 }
 
 func (reply *AppendEntriesReply) String() string {
@@ -44,30 +48,40 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Append, Args=%v", args.LeaderId, args.String())
 
+	// align the term
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		LOG(rf.me, rf.currentTerm, DDebug, "<- S%d, Reject append, Higher term, T%d>T%d",
 			args.LeaderId, rf.currentTerm, args.Term)
 		return
 	}
-
 	if args.Term >= rf.currentTerm {
 		rf.becomeFollowerLocked(args.Term)
 	}
 
+	// After we align the term, we accept the args.LeaderId as
+	// Leader, then we must reset election timer whether we
+	// accept the log or not
+	defer rf.resetElectionTimerLocked()
+
 	if args.PrevLogIndex >= len(rf.log) {
 		LOG(rf.me, rf.currentTerm, DReceiveLog, "<- S%d, Reject log, Follower log too short, "+
 			"Len:%d < Prev:%d", args.LeaderId, len(rf.log), args.PrevLogIndex)
+		reply.ConflictTerm = InvalidTerm
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		LOG(rf.me, rf.currentTerm, DReceiveLog, "<- S%d, Reject log, Prev log not match, [%d]: T%d != T%d",
 			args.LeaderId, args.PrevLogIndex, rf.log[args.PrevLogIndex].Term, args.PrevLogTerm)
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		reply.ConflictIndex = rf.firstLogFor(reply.ConflictTerm)
 		return
 	}
 
 	// log override rule
 	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	rf.persistLocked()
 	reply.Success = true
 	LOG(rf.me, rf.currentTerm, DReceiveLog, "Follower accept logs: (%d, %d]",
 		args.PrevLogIndex, args.PrevLogIndex+len(args.Entries))
@@ -78,8 +92,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = args.LeaderCommitIndex
 		rf.applyCond.Signal()
 	}
-
-	rf.resetElectionTimerLocked()
 }
 
 func (rf *Raft) getMajorityCommitIndexLocked() int {
@@ -119,14 +131,24 @@ func (rf *Raft) startReplication(term int) bool {
 		}
 		// try to find the lower matched log index if the prevLog not matched
 		if !reply.Success {
-			// go back a term
-			idx, term := args.PrevLogIndex, args.PrevLogTerm
-			for idx > 0 && rf.log[idx].Term == term {
-				idx--
+			prevIndex := rf.nextIndex[peer]
+			if reply.ConflictTerm == InvalidTerm {
+				rf.nextIndex[peer] = reply.ConflictIndex
+			} else {
+				firstIndex := rf.firstLogFor(reply.ConflictTerm)
+				if firstIndex != InvalidIndex {
+					rf.nextIndex[peer] = firstIndex
+				} else {
+					rf.nextIndex[peer] = reply.ConflictIndex
+				}
 			}
-			rf.nextIndex[peer] = idx + 1
-			LOG(rf.me, rf.currentTerm, DSendLog, "-> S%d, Not matched at %d, try next=%d", peer,
-				args.PrevLogIndex, rf.nextIndex[peer])
+			if rf.nextIndex[peer] > prevIndex {
+				rf.nextIndex[peer] = prevIndex
+			}
+
+			LOG(rf.me, rf.currentTerm, DSendLog, "-> S%d, Not matched at Prev=[%d]T%d, Try next Prev=[%d]T%d",
+				peer, args.PrevLogIndex, args.PrevLogTerm, rf.nextIndex[peer]-1, rf.log[rf.nextIndex[peer]-1])
+			LOG(rf.me, rf.currentTerm, DDebug, "-> S%d, Leader log=%v", peer, rf.logString())
 			return
 		}
 
@@ -135,7 +157,9 @@ func (rf *Raft) startReplication(term int) bool {
 		rf.nextIndex[peer] = rf.matchIndex[peer] + 1
 
 		majorityMatched := rf.getMajorityCommitIndexLocked()
-		if majorityMatched > rf.commitIndex {
+		// paper 5.4.2 Raft never commits log entries from previous terms by counting replicas.
+		// Only log entries from the leader's current term are committed by counting replicas.
+		if majorityMatched > rf.commitIndex && rf.log[majorityMatched].Term == term {
 			LOG(rf.me, rf.currentTerm, DApply, "Leader update the commit index %d->%d",
 				rf.commitIndex, majorityMatched)
 			rf.commitIndex = majorityMatched
