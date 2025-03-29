@@ -7,8 +7,6 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,7 +51,9 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 
-	log []LogEntry
+	// log in the Peer's local
+	log *RaftLog
+
 	// only use when it is leader. log view for each peer
 	matchIndex []int // match point probe when log synchronized
 	nextIndex  []int // match point records after log sync success
@@ -66,6 +66,7 @@ type Raft struct {
 	// lastApplied: last log index applied to state machine
 	lastApplied int
 	applyCh     chan raftapi.ApplyMsg
+	snapPending bool
 	applyCond   *sync.Cond
 
 	electionStart   time.Time
@@ -96,7 +97,7 @@ func (rf *Raft) becomeLeaderLocked() {
 	rf.role = Leader
 	for peer := 0; peer < len(rf.peers); peer++ {
 		rf.matchIndex[peer] = 0
-		rf.nextIndex[peer] = len(rf.log)
+		rf.nextIndex[peer] = rf.log.size()
 	}
 }
 
@@ -115,33 +116,6 @@ func (rf *Raft) becomeFollowerLocked(term int) {
 	}
 }
 
-func (rf *Raft) firstLogFor(term int) int {
-	for idx, entry := range rf.log {
-		if entry.Term == term {
-			return idx
-		} else if entry.Term > term {
-			break
-		}
-	}
-	return InvalidIndex
-}
-
-func (rf *Raft) logString() string {
-	var terms strings.Builder
-	prevTerm := rf.log[0].Term
-	prevTermStart := 0
-	for i := 0; i < len(rf.log); i++ {
-		if rf.log[i].Term != prevTerm {
-			fmt.Fprintf(&terms, " [%d, %d]T%d", prevTermStart, i-1, prevTerm)
-			prevTerm = rf.log[i].Term
-			prevTermStart = i
-		}
-	}
-
-	fmt.Fprintf(&terms, "[%d, %d]T%d", prevTermStart, len(rf.log)-1, prevTerm)
-	return terms.String()
-}
-
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -156,15 +130,6 @@ func (rf *Raft) PersistBytes() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.persister.RaftStateSize()
-}
-
-// the service says it has created a snapshot that has
-// all info up to and including index. this means the
-// service no longer needs the log through (and including)
-// that index. Raft should now trim its log as much as possible.
-func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (3D).
-
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -188,15 +153,15 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return 0, 0, false
 	}
 
-	rf.log = append(rf.log, LogEntry{
+	rf.log.append(LogEntry{
 		CommandValid: true,
 		Command:      command,
 		Term:         rf.currentTerm,
 	})
 	rf.persistLocked()
-	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", len(rf.log)-1, rf.currentTerm)
+	LOG(rf.me, rf.currentTerm, DLeader, "Leader accept log [%d]T%d", rf.log.size()-1, rf.currentTerm)
 
-	return len(rf.log) - 1, rf.currentTerm, true
+	return rf.log.size() - 1, rf.currentTerm, true
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -245,7 +210,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.resetElectionTimerLocked()
 
 	// a dummy entry to aovid lots of corner checks
-	rf.log = append(rf.log, LogEntry{Term: InvalidTerm})
+	rf.log = NewLog(InvalidIndex, InvalidTerm, nil, nil)
 
 	// initialize the leader's view slice
 	rf.nextIndex = make([]int, len(rf.peers))
@@ -254,6 +219,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize the fields used for apply
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.snapPending = false
 	rf.applyCh = applyCh
 	rf.applyCond = sync.NewCond(&rf.mu)
 

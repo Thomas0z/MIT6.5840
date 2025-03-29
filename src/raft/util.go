@@ -23,6 +23,7 @@ const (
 	DReceiveLog logTopic = "LOG2"
 	DApply      logTopic = "APLY"
 	DPersist    logTopic = "PERS"
+	DSnap       logTopic = "SNAP"
 )
 
 func getTopicLevel(topic logTopic) int {
